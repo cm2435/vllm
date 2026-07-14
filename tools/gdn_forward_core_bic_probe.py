@@ -89,7 +89,7 @@ def _make_inputs(
         * 0.05,
         "conv_bias": torch.randn(CONV_DIM, device=device, dtype=dtype) * 0.05,
         "conv_state": torch.randn(
-            len(lengths),
+            len(lengths) + 1,
             CONV_DIM,
             CONV_KERNEL - 1,
             device=device,
@@ -97,7 +97,7 @@ def _make_inputs(
         )
         * (0.05 if has_initial_state else 0.0),
         "ssm_state": torch.randn(
-            len(lengths),
+            len(lengths) + 1,
             NUM_V_HEADS,
             HEAD_V_DIM,
             HEAD_K_DIM,
@@ -127,7 +127,9 @@ def _run_stages(
     device = mixed_qkv.device
     cu = _cu_seqlens(lengths, device)
     cu_cpu = cu.cpu()
-    state_indices = torch.arange(len(lengths), dtype=torch.int32, device=device)
+    # State/cache index 0 is NULL_BLOCK_ID in vLLM metadata, so real cache
+    # entries must use positive indices.
+    state_indices = torch.arange(1, len(lengths) + 1, dtype=torch.int32, device=device)
     has_state = torch.full(
         (len(lengths),), has_initial_state, dtype=torch.bool, device=device
     )
@@ -233,8 +235,20 @@ def run_case(
         "b": inputs["b"][target_slice].clone(),
         "conv_weight": inputs["conv_weight"],
         "conv_bias": inputs["conv_bias"],
-        "conv_state": inputs["conv_state"][target_index : target_index + 1].clone(),
-        "ssm_state": inputs["ssm_state"][target_index : target_index + 1].clone(),
+        "conv_state": torch.cat(
+            [
+                inputs["conv_state"][:1].clone(),
+                inputs["conv_state"][target_index + 1 : target_index + 2].clone(),
+            ],
+            dim=0,
+        ),
+        "ssm_state": torch.cat(
+            [
+                inputs["ssm_state"][:1].clone(),
+                inputs["ssm_state"][target_index + 1 : target_index + 2].clone(),
+            ],
+            dim=0,
+        ),
         "A_log": inputs["A_log"],
         "dt_bias": inputs["dt_bias"],
         "lengths": [lengths[target_index]],
@@ -253,8 +267,8 @@ def run_case(
         _compare("conv_out", single["conv_out"], batched["conv_out"][target_slice]),
         _compare(
             "conv_state_after",
-            single["conv_state_after"],
-            batched["conv_state_after"][target_index : target_index + 1],
+            single["conv_state_after"][1:2],
+            batched["conv_state_after"][target_index + 1 : target_index + 2],
         ),
         _compare("q", single["q"], batched["q"][target_slice]),
         _compare("k", single["k"], batched["k"][target_slice]),
@@ -266,13 +280,13 @@ def run_case(
         ),
         _compare(
             "final_state",
-            single["final_state"],
+            single["final_state"][0:1],
             batched["final_state"][target_index : target_index + 1],
         ),
         _compare(
             "ssm_state_after",
-            single["ssm_state_after"],
-            batched["ssm_state_after"][target_index : target_index + 1],
+            single["ssm_state_after"][1:2],
+            batched["ssm_state_after"][target_index + 1 : target_index + 2],
         ),
     ]
 
