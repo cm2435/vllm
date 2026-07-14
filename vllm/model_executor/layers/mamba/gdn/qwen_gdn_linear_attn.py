@@ -310,7 +310,118 @@ class ChunkGatedDeltaRule(CustomOp):
         else:
             self._forward_method = self.forward_native
 
-    def forward_cuda(
+    def _forward_batch_invariant_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor,
+        use_qk_l2norm_in_kernel: bool,
+        core_attn_out: torch.Tensor | None,
+    ):
+        # Correctness-first BIC fallback: make each request see single-sequence
+        # chunk metadata, so unrelated batch neighbors cannot affect the target
+        # sequence's GDN prefill geometry.
+        assert q.shape[0] == 1
+        num_seqs = cu_seqlens.numel() - 1
+        out_segments: list[torch.Tensor] = []
+        final_state_segments: list[torch.Tensor] = []
+
+        for seq_idx in range(num_seqs):
+            start = int(cu_seqlens[seq_idx].item())
+            end = int(cu_seqlens[seq_idx + 1].item())
+            seq_len = end - start
+            seq_cu_seqlens = torch.tensor(
+                [0, seq_len], dtype=cu_seqlens.dtype, device=cu_seqlens.device
+            )
+            seq_chunk_indices = None
+            seq_chunk_offsets = None
+            if self.gdn_prefill_backend == "cutedsl":
+                from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
+                    prepare_metadata_cutedsl,
+                )
+
+                seq_chunk_indices, seq_chunk_offsets = prepare_metadata_cutedsl(
+                    seq_cu_seqlens,
+                    seq_len,
+                    FLA_CHUNK_SIZE,
+                )
+
+            if self.gdn_prefill_backend == "flashinfer":
+                seq_out, seq_final_state = self._forward_cuda_impl(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    initial_state=initial_state[seq_idx : seq_idx + 1],
+                    output_final_state=output_final_state,
+                    cu_seqlens=seq_cu_seqlens,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    core_attn_out=None,
+                )
+            elif self.gdn_prefill_backend == "cutedsl":
+                seq_out, seq_final_state = self._forward_cutedsl_impl(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    initial_state=initial_state[seq_idx : seq_idx + 1],
+                    output_final_state=output_final_state,
+                    cu_seqlens=seq_cu_seqlens,
+                    chunk_indices=seq_chunk_indices,
+                    chunk_offsets=seq_chunk_offsets,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    core_attn_out=None,
+                )
+            else:
+                seq_out, seq_final_state = self._forward_native_impl(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    initial_state=initial_state[seq_idx : seq_idx + 1],
+                    output_final_state=output_final_state,
+                    cu_seqlens=seq_cu_seqlens,
+                    chunk_indices=None,
+                    chunk_offsets=None,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    core_attn_out=None,
+                )
+            out_segments.append(seq_out)
+            if output_final_state:
+                assert seq_final_state is not None
+                final_state_segments.append(seq_final_state)
+
+        out = torch.cat(out_segments, dim=1)
+        final_state = (
+            torch.cat(final_state_segments, dim=0) if output_final_state else None
+        )
+        if core_attn_out is not None:
+            o_flat = out.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return out, final_state
+
+    def _should_use_batch_invariant_varlen(
+        self,
+        q: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> bool:
+        return (
+            envs.VLLM_BATCH_INVARIANT
+            and cu_seqlens is not None
+            and q.shape[0] == 1
+            and cu_seqlens.numel() > 2
+        )
+
+    def _forward_cuda_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -342,7 +453,49 @@ class ChunkGatedDeltaRule(CustomOp):
             co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
-    def forward_native(
+    def forward_cuda(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        if self._should_use_batch_invariant_varlen(q, cu_seqlens):
+            assert cu_seqlens is not None
+            return self._forward_batch_invariant_varlen(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                core_attn_out=core_attn_out,
+            )
+        return self._forward_cuda_impl(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
+        )
+
+    def _forward_native_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -372,7 +525,51 @@ class ChunkGatedDeltaRule(CustomOp):
             core_attn_out=core_attn_out,
         )
 
-    def forward_cutedsl(
+    def forward_native(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        if self._should_use_batch_invariant_varlen(q, cu_seqlens):
+            assert cu_seqlens is not None
+            return self._forward_batch_invariant_varlen(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                core_attn_out=core_attn_out,
+            )
+        return self._forward_native_impl(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
+        )
+
+    def _forward_cutedsl_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -414,6 +611,50 @@ class ChunkGatedDeltaRule(CustomOp):
         if not output_final_state:
             final_state = None
         return o, final_state
+
+    def forward_cutedsl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        if self._should_use_batch_invariant_varlen(q, cu_seqlens):
+            assert cu_seqlens is not None
+            return self._forward_batch_invariant_varlen(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                core_attn_out=core_attn_out,
+            )
+        return self._forward_cutedsl_impl(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
+        )
 
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
