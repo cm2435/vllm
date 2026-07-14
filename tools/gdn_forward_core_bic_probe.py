@@ -166,7 +166,7 @@ def _run_stages(
     beta = beta.unsqueeze(0)
 
     chunk_indices, chunk_offsets = _chunk_metadata(cu)
-    initial_state = ssm_state.clone()
+    initial_state = ssm_state[state_indices].clone()
     if not has_initial_state:
         initial_state.zero_()
 
