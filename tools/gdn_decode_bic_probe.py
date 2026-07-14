@@ -19,7 +19,10 @@ import argparse
 
 import torch
 
-from vllm.model_executor.layers.fla.ops import fused_sigmoid_gating_delta_rule_update
+from vllm.model_executor.layers.fla.ops import (
+    fused_recurrent_gated_delta_rule_packed_decode,
+    fused_sigmoid_gating_delta_rule_update,
+)
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 
 
@@ -137,6 +140,42 @@ def _run_decode(
     }
 
 
+def _run_packed_decode(
+    *,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_state: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    device = mixed_qkv.device
+    num_reqs = mixed_qkv.shape[0]
+    state_indices = torch.arange(1, num_reqs + 1, dtype=torch.int32, device=device)
+
+    ssm_state_after = ssm_state.clone()
+    out = torch.empty(
+        num_reqs, 1, NUM_V_HEADS, HEAD_V_DIM, device=device, dtype=mixed_qkv.dtype
+    )
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=HEAD_K_DIM**-0.5,
+        initial_state=ssm_state_after,
+        out=out,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+    torch.cuda.synchronize()
+    return {
+        "core_out": out.squeeze(1),
+        "ssm_state_after": ssm_state_after,
+    }
+
+
 def _compare(name: str, single: torch.Tensor, batched: torch.Tensor) -> tuple[bool, str]:
     equal = torch.equal(single, batched)
     diff = (single.float() - batched.float()).abs()
@@ -212,10 +251,74 @@ def run_case(num_reqs: int, target_index: int, state_dtype: torch.dtype) -> bool
     return ok
 
 
+def run_packed_case(num_reqs: int, target_index: int, state_dtype: torch.dtype) -> bool:
+    torch.manual_seed(91011)
+    device = torch.device("cuda")
+    inputs = _make_inputs(num_reqs, state_dtype, device)
+    target_cache_index = target_index + 1
+
+    single_inputs = {
+        "mixed_qkv": inputs["mixed_qkv"][target_index : target_index + 1].clone(),
+        "a": inputs["a"][target_index : target_index + 1].clone(),
+        "b": inputs["b"][target_index : target_index + 1].clone(),
+        "ssm_state": torch.cat(
+            [
+                inputs["ssm_state"][:1].clone(),
+                inputs["ssm_state"][target_cache_index : target_cache_index + 1].clone(),
+            ],
+            dim=0,
+        ),
+        "A_log": inputs["A_log"],
+        "dt_bias": inputs["dt_bias"],
+    }
+    batch_inputs = {
+        "mixed_qkv": inputs["mixed_qkv"],
+        "a": inputs["a"],
+        "b": inputs["b"],
+        "ssm_state": inputs["ssm_state"],
+        "A_log": inputs["A_log"],
+        "dt_bias": inputs["dt_bias"],
+    }
+
+    single = _run_packed_decode(**single_inputs)
+    batched = _run_packed_decode(**batch_inputs)
+
+    comparisons = [
+        _compare(
+            "packed_core_out",
+            single["core_out"],
+            batched["core_out"][target_index : target_index + 1],
+        ),
+        _compare(
+            "packed_ssm_state_after",
+            single["ssm_state_after"][1:2],
+            batched["ssm_state_after"][target_cache_index : target_cache_index + 1],
+        ),
+    ]
+    ok = all(equal for equal, _ in comparisons)
+    print(
+        {
+            "mode": "packed",
+            "num_reqs": num_reqs,
+            "target_index": target_index,
+            "state_dtype": str(state_dtype),
+            "ok": ok,
+        }
+    )
+    for _, line in comparisons:
+        print("  " + line)
+    return ok
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-reqs", type=int, default=8)
     parser.add_argument("--target-index", type=int, default=3)
+    parser.add_argument(
+        "--mode",
+        choices=["standard", "packed", "both"],
+        default="both",
+    )
     return parser.parse_args()
 
 
@@ -225,7 +328,10 @@ def main() -> None:
     all_ok = True
     for target_index in target_indices:
         for state_dtype in (torch.bfloat16, torch.float32):
-            all_ok &= run_case(args.num_reqs, target_index, state_dtype)
+            if args.mode in ("standard", "both"):
+                all_ok &= run_case(args.num_reqs, target_index, state_dtype)
+            if args.mode in ("packed", "both"):
+                all_ok &= run_packed_case(args.num_reqs, target_index, state_dtype)
     if not all_ok:
         raise SystemExit(1)
 
