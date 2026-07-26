@@ -295,6 +295,37 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+template <typename P, int ngpus>
+DINLINE P packed_tree_reduce(const P* ptrs[], int idx) {
+  static_assert(ngpus == 2 || ngpus == 4 || ngpus == 8,
+                "tree all-reduce only supports ngpus in (2,4,8)");
+  if constexpr (ngpus == 2) {
+    P sum01 = ptrs[0][idx];
+    packed_assign_add(sum01, ptrs[1][idx]);
+    return sum01;
+  } else if constexpr (ngpus == 4) {
+    P sum01 = ptrs[0][idx];
+    packed_assign_add(sum01, ptrs[1][idx]);
+    P sum23 = ptrs[2][idx];
+    packed_assign_add(sum23, ptrs[3][idx]);
+    packed_assign_add(sum01, sum23);
+    return sum01;
+  } else {
+    P sum01 = ptrs[0][idx];
+    packed_assign_add(sum01, ptrs[1][idx]);
+    P sum23 = ptrs[2][idx];
+    packed_assign_add(sum23, ptrs[3][idx]);
+    P sum45 = ptrs[4][idx];
+    packed_assign_add(sum45, ptrs[5][idx]);
+    P sum67 = ptrs[6][idx];
+    packed_assign_add(sum67, ptrs[7][idx]);
+    packed_assign_add(sum01, sum23);
+    packed_assign_add(sum45, sum67);
+    packed_assign_add(sum01, sum45);
+    return sum01;
+  }
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -309,6 +340,21 @@ __global__ void __launch_bounds__(512, 1)
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
        idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_tree(RankData* _dp, RankSignals sg, Signal* self_sg,
+                             T* __restrict__ result, int rank, int size) {
+  using P = typename packed_t<T>::P;
+  auto dp = *_dp;
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    ((P*)result)[idx] =
+        packed_tree_reduce<P, ngpus>((const P**)&dp.ptrs[0], idx);
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
@@ -562,6 +608,7 @@ class CustomAllreduce {
     const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
     bool force_1stage = false;
     bool force_2stage = false;
+    bool force_tree = false;
     if (env_algo != nullptr) {
       if (std::strcmp(env_algo, "1stage") == 0 ||
           std::strcmp(env_algo, "oneshot") == 0) {
@@ -569,10 +616,12 @@ class CustomAllreduce {
       } else if (std::strcmp(env_algo, "2stage") == 0 ||
                  std::strcmp(env_algo, "twoshot") == 0) {
         force_2stage = true;
+      } else if (std::strcmp(env_algo, "tbik_tree") == 0) {
+        force_tree = true;
       } else {
         throw std::runtime_error(
             "Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
-            ". Valid values: 1stage, oneshot, 2stage, twoshot");
+            ". Valid values: 1stage, oneshot, 2stage, twoshot, tbik_tree");
       }
     }
 
@@ -585,6 +634,15 @@ class CustomAllreduce {
       KL(ngpus, cross_device_reduce_1stage);            \
     } else if (force_2stage) {                          \
       KL(ngpus, cross_device_reduce_2stage);            \
+    } else if (force_tree) {                            \
+      if constexpr (ngpus == 2 || ngpus == 4 ||         \
+                    ngpus == 8) {                       \
+        KL(ngpus, cross_device_reduce_tree);            \
+      } else {                                          \
+        throw std::runtime_error(                       \
+            "tbik_tree only supports num gpus in "      \
+            "(2,4,8)");                                 \
+      }                                                 \
     } else {                                            \
       if (world_size_ == 2) {                           \
         KL(ngpus, cross_device_reduce_1stage);          \

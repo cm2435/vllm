@@ -65,6 +65,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.use_bic_allgather_tree = (
+            envs.VLLM_BATCH_INVARIANT
+            and envs.VLLM_BIC_ALLREDUCE_BACKEND == "allgather_tree"
+            and "tp" in unique_name
+        )
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -215,6 +220,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "BIC_ALLGATHER_TREE",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
             "FLASHINFER",
@@ -224,6 +230,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.use_bic_allgather_tree:
+            enabled_ar_backends.append("BIC_ALLGATHER_TREE")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
         # VLLM_BATCH_INVARIANT off, NCCL symm mem enabled, world_size meets
         # min_world_size, and world_size either has a tuned entry in
@@ -255,7 +263,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
         if self.ca_comm is not None and not self.ca_comm.disabled:
-            enabled_ar_backends.append("CUSTOM")
+            enabled_ar_backends.append(
+                "BIC_TBIK_TREE"
+                if (
+                    envs.VLLM_BATCH_INVARIANT
+                    and envs.VLLM_BIC_ALLREDUCE_BACKEND == "tbik_tree"
+                )
+                else "CUSTOM"
+            )
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
             enabled_ar_backends.append("SYMM_MEM")
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
@@ -271,6 +286,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        if self.use_bic_allgather_tree:
+            return self._allgather_tree_all_reduce(input_)
+
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -337,6 +355,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
+
+    def _allgather_tree_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError(
+                "BIC AllGather tree requires an initialized PyNCCL communicator"
+            )
+
+        gathered = torch.empty(
+            (self.world_size,) + tuple(input_.shape),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        pynccl_comm.all_gather(gathered, input_.contiguous())
+
+        level = list(gathered.unbind(0))
+        while len(level) > 1:
+            level = [
+                torch.add(level[index], level[index + 1])
+                for index in range(0, len(level), 2)
+            ]
+        return level[0]
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when

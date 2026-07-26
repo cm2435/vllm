@@ -992,7 +992,21 @@ class ParallelConfig:
 
         # Enable batch invariance settings if requested
         if envs.VLLM_BATCH_INVARIANT:
-            self.disable_custom_all_reduce = True
+            bic_allreduce_backend = envs.VLLM_BIC_ALLREDUCE_BACKEND
+            if bic_allreduce_backend in ("vllm_1stage", "tbik_tree"):
+                selected_algorithm = envs.VLLM_CUSTOM_ALLREDUCE_ALGO
+                expected_algorithms = {
+                    "vllm_1stage": ("1stage", "oneshot"),
+                    "tbik_tree": ("tbik_tree",),
+                }[bic_allreduce_backend]
+                if selected_algorithm not in expected_algorithms:
+                    raise ValueError(
+                        f"VLLM_BIC_ALLREDUCE_BACKEND={bic_allreduce_backend} "
+                        "requires VLLM_CUSTOM_ALLREDUCE_ALGO="
+                        f"{expected_algorithms[0]}"
+                    )
+            else:
+                self.disable_custom_all_reduce = True
 
         if (
             self.distributed_executor_backend is not None

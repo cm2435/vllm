@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -64,6 +67,34 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _trace_inference_lab_scheduler_output(
+    scheduler_output: SchedulerOutput,
+) -> None:
+    if os.getenv("INFERENCE_LAB_ENABLE_BIC_TRACE", "0") != "1":
+        return
+
+    cached = scheduler_output.scheduled_cached_reqs
+    trace_row = {
+        "event": "bic_trace_scheduler_output",
+        "created_at_unix": time.time(),
+        "scheduled_new_req_ids": [
+            request.req_id for request in scheduler_output.scheduled_new_reqs
+        ],
+        "scheduled_running_req_ids": list(cached.req_ids),
+        "cached_req_ids": list(cached.req_ids),
+        "cached_num_output_tokens": list(cached.num_output_tokens),
+        "num_scheduled_tokens": dict(scheduler_output.num_scheduled_tokens),
+        "total_num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+    }
+    path = Path(os.getenv("VLLM_BIC_TRACE_PATH", "/tmp/bic_trace.jsonl"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(trace_row, sort_keys=True) + "\n")
+    except OSError as exc:
+        logger.warning_once("Failed to write inference-lab BIC trace: %s", exc)
 
 
 class Scheduler(SchedulerInterface):
@@ -1156,6 +1187,8 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+
+        _trace_inference_lab_scheduler_output(scheduler_output)
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

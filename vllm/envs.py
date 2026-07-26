@@ -87,6 +87,12 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_BIC_ALLREDUCE_BACKEND: Literal[
+        "nccl", "vllm_1stage", "allgather_tree", "tbik_tree"
+    ] = "nccl"
+    VLLM_CUSTOM_ALLREDUCE_ALGO: Literal[
+        "", "1stage", "oneshot", "2stage", "twoshot", "tbik_tree"
+    ] = ""
     VLLM_TRITON_USE_TD: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
@@ -601,6 +607,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Experimental selector for comparing fixed-order tensor-parallel
+    # all-reduce implementations under batch-invariant serving.
+    "VLLM_BIC_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_BIC_ALLREDUCE_BACKEND",
+        "nccl",
+        ["nccl", "vllm_1stage", "allgather_tree", "tbik_tree"],
+        case_sensitive=False,
+    ),
+    "VLLM_CUSTOM_ALLREDUCE_ALGO": env_with_choices(
+        "VLLM_CUSTOM_ALLREDUCE_ALGO",
+        "",
+        ["", "1stage", "oneshot", "2stage", "twoshot", "tbik_tree"],
+        case_sensitive=False,
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton
